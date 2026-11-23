@@ -246,42 +246,64 @@ python scripts/apc_nmc2_tool.py scp-backup <UPS_IP> backups\card_v7.1.2_hardened
 ## 5. Troubleshooting & Field-Tested Gotchas
 
 ### 1. Card Loses IPv4 After Flashing `aos_664.bin` (Link UP, No ARP/Ping)
-- **Cause:** Upgrading from `v5.x` → `v6.x` while in DHCP mode can reset `DHCPRequireCookie` to `enabled`. If your DHCP server does not supply Option 43 `1APC` (`01:04:31:41:50:43`), the card ignores every DHCP offer and holds `0.0.0.0`.
+- **Cause:** Upgrading from `v5.x` → `v6.x` while in DHCP mode can reset `DHCPRequireCookie` to `enabled`. If your DHCP server does not supply Option 43 `1APC` (`01:04:31:41:50:43`), the card ignores every DHCP offer and holds `0.0.0.0` (Status LED flashing green).
 - **Prevention:** Set temporary `boot -b manual` static IPv4 before flashing `aos_664.bin` (Step 1 above).
-- **Layer-2 Recovery (`arp -s` + 113-byte ping):** On an elevated Windows Command Prompt (Administrator) on the same Layer-2 VLAN, **explicitly bind your wired NIC's IP** (critical if Hyper-V, VirtualBox, or Wi-Fi adapters exist):
+- **Windows 11 `arp -s` `Access is denied` Fix:** Even in an elevated Administrator terminal, legacy `arp -s` frequently throws `The ARP entry addition failed: Access is denied.` on Windows 10/11. Use `netsh` instead (specifying your wired adapter name, e.g., `"Ethernet"`):
   ```cmd
-  arp -s <DESIRED_UPS_IP> 00-c0-b7-xx-xx-xx <LAPTOP_WIRED_LAN_IP>
-  ping <DESIRED_UPS_IP> -l 113 -n 4
+  netsh interface ipv4 add neighbors "Ethernet" <DESIRED_UPS_IP> 00-c0-b7-xx-xx-xx
+  ping <DESIRED_UPS_IP> -l 113 -n 6
   ```
-  Wait 10–15 seconds and probe FTP port 21 (`AOS v6.6.4`) or Telnet port 23. Alternatively, test IPv6 link-local derived from the card's MAC (`fe80::2c0:b7ff:fexx:xxxx%<InterfaceIndex>`).
+- **Cleanup Warning (Leftover Permanent ARP Entries):** Always remove temporary static neighbors when moving to another card (`netsh interface ipv4 delete neighbors "Ethernet" <DESIRED_UPS_IP>`). A forgotten `Permanent` ARP entry pointing to Card A's MAC will silently hijack packets sent to Card B on that same IP!
 
-### 2. Modern OpenSSH / Paramiko Refuses to Connect (`no matching host key type found. Their offer: ssh-rsa`)
+### 2. Discovering Cards with Unknown Static IPs or Disabled DHCP (`tshark` + IPv6 Link-Local)
+- **Fastest bench workflow:** Plug the card directly into a laptop Ethernet port configured on an isolated bench subnet (e.g., `192.168.55.1/24`, no gateway, keeping internet on Wi-Fi).
+- Capture non-host frames with Wireshark/`tshark`:
+  ```powershell
+  tshark -i "Ethernet" -f "not ether src <LAPTOP_NIC_MAC>"
+  ```
+- Within seconds of boot, healthy cards announce their MAC, any configured static IPv4 (`ARP Announcement`), and their IPv6 link-local address (`fe80::2c0:b7ff:fexx:xxxx`).
+- **IPv6 Link-Local Shortcut:** Even when a card has a static IPv4 on a completely different subnet (or `0.0.0.0` with `N4?`), you can connect directly to `fe80::2c0:b7ff:fexx:xxxx%<InterfaceIndex>` over Telnet (port 23) to reconfigure a temporary bench IPv4 (`tcpip -i ...`, `boot -b manual`, `reboot`) without changing your workstation subnet or factory-resetting the card!
+- **Isolated Option-43 (`1APC`) DHCP Testing:** On an isolated direct Ethernet link, you can also test a card against a local DHCP responder supplying Option 43 (`0x2b 0x06 0x01 0x04` + `1APC`) to wake `DHCPRequireCookie=enabled` cards, and then verify final `boot -b dhcp -c disable` against a plain DHCP server **without** Option 43 before deploying into production.
+
+### 3. Recovering Cards Stalled on Newer `AOS` with Missing `sumx` (`Stat: A-`)
+- **Symptoms:** Banner reports `AOS v7.1.8` (or similar), `Stat: P+ N4+ N6+ A-`, `dir` shows only `apc_hw05_aos_*.bin`, and `RETR config.ini` fails with `550 RETR requested action not taken` (no `config.ini` is generated without an application module).
+- **Fix:** Unlike Schneider Electric's GUI Firmware Upgrade Wizard (which blocks downgrades), manual binary FTP cleanly accepts a matched `v7.1.x` pair (`bootmon v1.0.9` is shared across `v6.9.6`–`v7.2.2`). Upload `apc_hw05_aos_712.bin`, verify the `AOS v7.1.2` FTP banner, then upload `apc_hw05_sumx_712.bin` and verify `Stat: P+ N4+ N6+ A+`.
+
+### 4. Set the Current Date/Time BEFORE Enabling HTTPS
+- **Cause:** Cards that sat unpowered often boot with an old clock (e.g., `2010`). Enabling HTTPS before setting the clock causes the NMC2 to generate a self-signed TLS certificate dated in the past.
+- **Fix:** Always run `date -z <UTC_OFFSET>` and `date -d MM/DD/YYYY -t HH:MM:SS` (plus `ntp -e enable`) **before** `web -s enable -mp TLS1.2`.
+
+### 5. Watchdog Boot-Loop Diagnosis (Hardware Reset Loop vs DHCP Wait)
+- **Symptoms:** Card shows link UP and flashing green LED, sends **zero** Ethernet packets in `tshark`, and ignores both `netsh` + `ping -l 113` and DHCP offers.
+- **How to confirm in 15 seconds:** Poll the direct Ethernet adapter link state every 400 ms. A hardware watchdog boot-loop produces a periodic `Up 100 Mbps → Disconnected → Up 100 Mbps` cycle (e.g., every ~13.4 seconds) accompanied by single `0x00`/`0xf0` serial UART line-toggle glitches.
+- **Recovery:** Requires a verified serial console chain into Boot Monitor (`BM>`, `57600 8N1`, tapping Reset and sending `Enter`), followed by `format` / `factory_reset` and sequential XMODEM upload (`aos` then `sumx`).
+
+### 6. Modern OpenSSH / Paramiko Refuses to Connect (`no matching host key type found. Their offer: ssh-rsa`)
 - **Cause:** APC NMC2's embedded `SSH-2.0-cryptlib` daemon offers `ssh-rsa` host keys even on `v7.1.2`. OpenSSH 8.8+ disables `ssh-rsa` by default, and Paramiko 5.0+ removed SHA-1 RSA verification altogether.
 - **Fix:** Use native OpenSSH with compatibility flags:
   ```powershell
   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa apc@<UPS_IP>
   ```
 
-### 3. `scp` Fails with SFTP Error or `apc-scp: file open error` or `Connection closed`
+### 7. `scp` Fails with SFTP Error, `apc-scp: file open error`, or `Connection closed`
 - **Three distinct APC NMC2 SCP quirks:**
   1. **Use `scp -O`:** OpenSSH 9.x defaults `scp` to SFTP, which NMC2 does not implement. Pass `-O` to force legacy SCP protocol.
   2. **No leading slash:** Request `apc@<UPS_IP>:config.ini`, **not** `:/config.ini` (which fails with `apc-scp: file open error`).
-  3. **Single concurrent SSH/SCP session:** NMC2 allows only one active SSH/SCP session at a time. Wait 3–5 seconds after closing an `ssh` session before running `scp`.
+  3. **Single concurrent SSH/SCP session:** NMC2 allows only one active SSH/SCP session at a time. Wait 3–5 seconds after closing an `ssh` session before running `scp`. *(NMC2 may also close the SCP channel right after sending the final byte of `config.ini` — verify the local file size and header even if `scp` returns exit code 1.)*
 
-### 4. `snmp -S disable -a1 disable` Returns `E102: Parameter Error`
+### 8. `snmp -S disable -a1 disable` Returns `E102: Parameter Error`
 - **Cause:** NMC2's `snmp` CLI parser rejects combining `-S` with `-a[n]` flags in one command.
 - **Fix:** Run `snmp -S disable`, then `snmp -a1 disable` through `snmp -a4 disable` as separate commands.
 
-### 5. Serial Console Gotchas (Cable Type & Prolific Code 10)
-- **Wrong port:** The UPS chassis **DB9** and **USB-B** ports talk to the UPS microcontroller (PowerChute/NUT), **not** the AP9630 card. The AP9630 serial console is the tiny **2.5 mm TRS jack** on the card faceplate (APC cable `940-0299A`, **9600 baud, 8N1, no flow control**).
-- **Windows 11 Prolific PL2303 Code 10:** Older Prolific USB-to-serial adapters (`VID_067B&PID_2303&REV_0300`, PL2303HXA) fail to start (`CM_PROB_FAILED_START`, Code 10) under Windows Prolific drivers `3.4.x+`. Use an FTDI/CH340/PL2303GC adapter (or legacy `3.3.2.102` driver) if serial recovery is strictly required.
+### 9. Serial Console Gotchas (Cable Pinout, Windows 11 HVCI & Linux Workaround)
+- **Wrong port:** The UPS chassis **DB9** and **USB-B** ports talk to the UPS microcontroller (PowerChute/NUT), **not** the AP9630 card. The AP9630 serial console is the tiny **2.5 mm TRS jack** on the card faceplate (APC cable `940-0299` / `940-0299A`: **Tip → DB9 Pin 3 [PC TX]**, **Ring → DB9 Pin 2 [PC RX]**, **Sleeve → DB9 Pin 5 [GND]**; **9600 8N1** for AOS CLI, **57600 8N1** for `BM>` BootMonitor). Always validate an unknown 2.5 mm cable against a known-good card at `9600 8N1` before trusting it on a bricked card!
+- **Windows 11 Prolific PL2303HXA (`REV_0300`) Code 10 + Memory Integrity (HVCI):** Older Prolific adapters (`VID_067B&PID_2303&REV_0300`) fail with Code 10 under Prolific Windows drivers `3.4.x+`, and Windows 11 **Memory Integrity (HVCI)** blocks legacy `2008` `3.3.2.102` drivers unless HVCI is disabled. **Clean workaround:** Plug the Prolific adapter into any Linux host — the Linux kernel `pl2303` driver supports `REV_0300` natively as `/dev/ttyUSB0` with zero Code 10 errors and no disabling Windows security.
 
-### 6. Slow Uploads (~50s per 3 MB `.bin`) & 10 Mbps Half-Duplex Link
-- **Cause:** Older AP9630 PHY chips sometimes auto-negotiate `10 Half_Duplex` with modern gigabit switches.
-- **Behavior:** Completely safe for upgrades — a 3.1 MB `.bin` takes ~48–50 seconds to upload, followed by ~60–70 seconds of flash erase/write + reboot for `aos`, and ~17–25 seconds for `bootmon`/`sumx`. Do not interrupt power during flash commit.
-
-### 7. OpenSSL 3.x `UNSAFE_LEGACY_RENEGOTIATION_DISABLED` on HTTPS
-- **Cause:** Python/OpenSSL 3.x enforces RFC 5746 secure renegotiation strictly, whereas NMC2's embedded TLS 1.2 stack omits the extension on some handshakes. Modern Chromium/Edge/Firefox browsers connect cleanly to `https://<UPS_IP>` after accepting the self-signed certificate.
+### 10. Upload Timing, `upsabout` Handshake Delay & OpenSSL 3.x HTTPS
+- **Upload / reboot timing:** Even on a `100 Mbps` link (or `10 Half_Duplex`), a ~3.1 MB `.bin` takes ~43–50 seconds to upload due to NMC2 CPU/flash buffering, followed by ~55–70s of flash write + reboot for `aos`, ~16–25s for `bootmon`/`sumx`, and ~75–95s on first boot after enabling SSH/HTTPS (RSA host key + TLS cert generation). Do not interrupt power during flash commit.
+- **`upsabout` returns `E101: Command Not Found`:** Normal for the first 2–5 minutes after seating a card into a Smart-UPS (or if the UPS is powered off) until the SmartSlot finishes handshaking.
+- **NUT `snmp-ups` OID warnings on legacy Smart-UPS:** During startup, NUT's `snmp-ups` (`mibs = apcc`) logs harmless `Warning: type error exception (OID = .1.3.6.1.4.1.318.1.1.1.9...)` lines for 3-phase/extended OIDs that single-phase SUA Smart-UPS models do not expose, followed by `Connected to UPS [...]` and full live sensors. Keep the exact same `name:` when migrating from `usbhid-ups` to `snmp-ups` to preserve all Home Assistant entity IDs in-place.
+- **OpenSSL 3.x `UNSAFE_LEGACY_RENEGOTIATION_DISABLED`:** Python/OpenSSL 3.x enforces RFC 5746 strictly against NMC2's embedded TLS 1.2 stack; modern Chromium/Edge/Firefox browsers connect normally to `https://<UPS_IP>` after accepting the self-signed certificate.
 
 ---
 
